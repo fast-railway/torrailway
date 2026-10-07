@@ -1,0 +1,120 @@
+================================================================================
+                    TOR ENGINE COMPLETE CONFIGURATION MANUAL
+================================================================================
+
+1. LINK FORMATS & 88% / 12% TRAFFIC SPLIT
+--------------------------------------------------------------------------------
+
+[ LINKS ]
+  - Full absolute URLs.
+  - Safe operation: If SHORT_LINKS is omitted, 100% of traffic routes to LINKS 
+    without throwing warnings or errors.
+  - Example: LINKS=https://site.com/post-a,https://site.com/post-b
+
+[ BASE_URL ]
+  - Root domain to attach slugs and short paths.
+  - Example: BASE_URL=https://site.com
+
+[ SHORT_LINKS ]
+  - Slugs, sub-paths, or query parameters.
+  - Example: SHORT_LINKS=news-today,article-5,?source=app
+  - Resolves to:
+      https://site.com/news-today
+      https://site.com/article-5
+      https://site.com?source=app
+
+[ AUTOMATIC 88% / 12% SPLIT ]
+  - When BOTH "SHORT_LINKS" and "LINKS" are supplied:
+      * 88% of visits route to SHORT_LINKS
+      * 12% of visits route to LINKS
+  - If only LINKS exists: 100% routes to LINKS.
+  - If only SHORT_LINKS exists: 100% routes to SHORT_LINKS.
+
+
+2. DEVICE MODES & SIMPLE "1" EXCLUSIONS
+--------------------------------------------------------------------------------
+
+[ DEVICE_TYPE ]
+  - Sets the platform profile.
+  - Accepted values:
+      * both    : (Default) Natural mix (Mobile ~60%, Desktop ~40%).
+      * desktop : 100% Desktop user agents.
+      * mobile  : 100% Mobile user agents.
+
+[ EXCLUDE_DESKTOP ]
+  - Set EXCLUDE_DESKTOP=1 to block desktop agents (forces 100% mobile).
+
+[ EXCLUDE_MOBILE ]
+  - Set EXCLUDE_MOBILE=1 to block mobile agents (forces 100% desktop).
+
+[ BROWSER_FILTER ]
+  - Locks all requests to a specific browser family.
+  - Accepted values: all (Default), chrome, safari, firefox, edge, opera.
+
+
+3. DYNAMIC BROWSER LOGIC (APPLE 70/25/5 VS OTHER PLATFORMS)
+--------------------------------------------------------------------------------
+
+[ Apple Ecosystem (macOS & iOS) ]
+  When macOS or iOS is selected as the operating system, the engine mimics 
+  realistic default-browser usage:
+  - 70% Safari (Native Default):
+      * macOS: Safari 17.4 through Safari 19.2
+      * iOS: Mobile Safari 17.5 through Mobile Safari 19.2 & iPadOS
+  - 25% Chrome:
+      * macOS: Chrome 135 through Chrome 148
+      * iOS: CriOS 137 through CriOS 149
+  - 5% Real Alternative Browsers:
+      * Firefox (FxiOS 136-142 on iOS, Firefox 130-141 on macOS)
+      * Edge (Mac Edge 137-146)
+      * Opera (Opera Touch iOS 4-6, Opera Mac 114-118)
+
+[ Non-Apple Platforms (Windows, Android, Linux) ]
+  - Android (60% of Mobile):
+      * ~65% Chrome Mobile (v133 - v149)
+      * ~20% Firefox Mobile (v133 - v143)
+      * ~15% Opera Mobile (v80 - v87)
+  - Windows (60% of Desktop):
+      * ~65% Chrome Desktop (v133 - v149)
+      * ~15% Microsoft Edge (v131 - v148)
+      * ~15% Firefox Desktop (v130 - v143)
+      * ~5% Opera Desktop (v115 - v120)
+  - Linux (7% of Desktop):
+      * Chrome, Firefox, Edge, Opera
+
+
+4. REFERRERS & DIRECT TRAFFIC
+--------------------------------------------------------------------------------
+
+[ REFERRERS ]
+  - Default: Automatically includes "none" mixed alongside major search and 
+    social platforms (Google, Bing, Yahoo, DuckDuckGo, X/Twitter, Instagram, 
+    Facebook, Reddit, YouTube, Telegram, Discord).
+  - When "none" is randomly chosen, the HTTP Referer header is omitted 
+    completely, generating true Direct Traffic.
+  - Custom examples:
+      * REFERRERS=none                      -> 100% Direct Traffic.
+      * REFERRERS=https://google.com/,none  -> 50/50 mix of Google and Direct.
+
+
+5. COUNTRY FILTERING & EXIT NODES
+--------------------------------------------------------------------------------
+
+[ INCLUDE_COUNTRIES ]
+  - Limits Tor exit circuits to specified ISO codes (e.g. US,DE,FR,NL).
+  - Case-insensitive (e.g. ru, RU, Ru are equivalent).
+  - Default: Empty (All countries worldwide).
+
+[ EXCLUDE_COUNTRIES ]
+  - Excludes listed countries from being Tor exit relays.
+  - Conflict Rule: If a country is listed in BOTH INCLUDE and EXCLUDE, 
+    EXCLUDE takes priority and strips it from the allowed pool.
+
+
+6. TIMING & CYCLE CONTROLS
+--------------------------------------------------------------------------------
+
+[ WORKER_COUNT_RANGE ]   : Number of bots run per cycle. Default: 3,5
+[ WORKER_GAP_RANGE ]     : Pause between workers in seconds. Default: 6.0,12.0
+[ CYCLE_INTERVAL_RANGE ] : Total target duration of each cycle in seconds. Default: 45.0,60.0
+================================================================================
