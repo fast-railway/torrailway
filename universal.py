@@ -1,14 +1,14 @@
+import asyncio
 from datetime import datetime
 import json
 import os
 import random
 import socket
-import ssl
-import struct
 import subprocess
 import sys
 import time
 import urllib.parse
+from playwright.async_api import async_playwright
 
 # ---------------------------------------------------------
 # Environment Parsers & Configuration
@@ -37,11 +37,12 @@ def parse_list(var_name: str, defaults: list):
     return items if items else defaults
 
 
-WORKER_MIN, WORKER_MAX = parse_range("WORKER_COUNT_RANGE", 3, 5)
+# Worker execution settings (2-6 workers, 50.0-70.0s cycle duration)
+WORKER_MIN, WORKER_MAX = parse_range("WORKER_COUNT_RANGE", 2, 6)
 GAP_MIN, GAP_MAX = parse_range("WORKER_GAP_RANGE", 6.0, 12.0)
-CYCLE_MIN, CYCLE_MAX = parse_range("CYCLE_INTERVAL_RANGE", 45.0, 60.0)
+CYCLE_MIN, CYCLE_MAX = parse_range("CYCLE_INTERVAL_RANGE", 50.0, 70.0)
 
-# Device Configuration & Exclusions (Writing "1" excludes that device type)
+# Device Configuration & Exclusions ("1" excludes that device type)
 EXCLUDE_DESKTOP = os.getenv("EXCLUDE_DESKTOP", "").strip() == "1"
 EXCLUDE_MOBILE = os.getenv("EXCLUDE_MOBILE", "").strip() == "1"
 
@@ -55,162 +56,218 @@ else:
 
 BROWSER_FILTER = os.getenv("BROWSER_FILTER", "all").strip().lower()
 
-# Country Filter Logic (Case-insensitive & conflict resolution)
+# Country Filter Logic
 RAW_INCLUDE_COUNTRIES = [c.upper() for c in parse_list("INCLUDE_COUNTRIES", [])]
 RAW_EXCLUDE_COUNTRIES = [c.upper() for c in parse_list("EXCLUDE_COUNTRIES", [])]
 FINAL_EXCLUDE_COUNTRIES = set(RAW_EXCLUDE_COUNTRIES)
 FINAL_INCLUDE_COUNTRIES = [c for c in RAW_INCLUDE_COUNTRIES if c not in FINAL_EXCLUDE_COUNTRIES]
 
+# Referrers Pool with natural direct traffic weighting
 DEFAULT_REFERRERS = [
     "none",
-    "https://www.google.com/",
-    "https://www.bing.com/",
-    "https://duckduckgo.com/",
-    "https://search.yahoo.com/",
-    "https://www.facebook.com/",
-    "https://l.facebook.com/",
-    "https://www.instagram.com/",
     "https://t.co/",
-    "https://x.com/",
-    "https://twitter.com/",
-    "https://www.reddit.com/",
-    "https://web.telegram.org/",
-    "https://discord.com/",
-    "https://www.youtube.com/"
+    "none",
+    "https://l.facebook.com/",
+    "https://l.instagram.com/",
+    "https://www.youtube.com/",
+    "none",
+    "https://www.reddit.com/"
 ]
 REFERRERS = parse_list("REFERRERS", DEFAULT_REFERRERS)
+LANDING_PAGES = parse_list("LANDING_PAGES", [])
 
 TOR_SOCKS_PORT = 9050
 TOR_CONTROL_PORT = 9051
 
 
 # ---------------------------------------------------------
-# OS-Specific User-Agent Database
+# Screen Resolutions & Display Metadata
+# ---------------------------------------------------------
+SCREEN_RESOLUTIONS = {
+    "desktop": [
+        {"res": "1920x1080", "width": 1920, "height": 1080},
+        {"res": "1536x864",  "width": 1536, "height": 864},
+        {"res": "1440x900",  "width": 1440, "height": 900},
+        {"res": "1366x768",  "width": 1366, "height": 768},
+        {"res": "2560x1440", "width": 2560, "height": 1440},
+        {"res": "1680x1050", "width": 1680, "height": 1050}
+    ],
+    "android": [
+        {"res": "412x915", "width": 412, "height": 915},
+        {"res": "384x854", "width": 384, "height": 854},
+        {"res": "393x873", "width": 393, "height": 873},
+        {"res": "412x892", "width": 412, "height": 892},
+        {"res": "360x800", "width": 360, "height": 800},
+        {"res": "412x919", "width": 412, "height": 919},
+        {"res": "360x780", "width": 360, "height": 780}
+    ],
+    "ios": [
+        {"res": "393x852",  "width": 393, "height": 852},
+        {"res": "430x932",  "width": 430, "height": 932},
+        {"res": "390x844",  "width": 390, "height": 844},
+        {"res": "375x812",  "width": 375, "height": 812},
+        {"res": "834x1194", "width": 834, "height": 1194},
+        {"res": "1024x1366","width": 1024, "height": 1366}
+    ]
+}
+
+
+# ---------------------------------------------------------
+# Comprehensive User-Agent Database (Rich Hardware Models)
 # ---------------------------------------------------------
 UA_DATABASE = {
     "desktop": {
         "windows": {
             "chrome": [
-                {"browser": "Chrome 149", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"},
-                {"browser": "Chrome 148", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"},
-                {"browser": "Chrome 143", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"},
-                {"browser": "Chrome 137", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"},
-                {"browser": "Chrome 133", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"}
+                {"browser": "Chrome Standard",        "ver": "140", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 151 (Surface)",   "ver": "151", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Surface Pro 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 150 (Dell XPS)",   "ver": "150", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Dell XPS 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 148 (ThinkPad)",  "ver": "148", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; ThinkPad X1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 146 (HP Envy)",   "ver": "146", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; HP Envy x360) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 145 (ROG Strix)", "ver": "145", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; ASUS ROG Strix) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 143 (ZenBook)",   "ver": "143", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; ASUS ZenBook) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 141 (Legion 5)",  "ver": "141", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Lenovo Legion 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 137 (Acer Swift)","ver": "137", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Acer Swift 3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 133 (Razer Blade)","ver": "133", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Razer Blade 16) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"}
             ],
             "edge": [
-                {"browser": "Edge 148", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"},
-                {"browser": "Edge 143", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"},
-                {"browser": "Edge 139", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0"},
-                {"browser": "Edge 135", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"}
+                {"browser": "Edge Standard",       "ver": "140", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0"},
+                {"browser": "Edge 150 (Surface Laptop)","ver": "150", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Surface Laptop 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"},
+                {"browser": "Edge 148 (Dell Latitude)","ver": "148", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Latitude 7440) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"},
+                {"browser": "Edge 145 (ThinkBook)",   "ver": "145", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Lenovo ThinkBook) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"},
+                {"browser": "Edge 143 (HP Pavilion)", "ver": "143", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; HP Pavilion 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"},
+                {"browser": "Edge 138 (Alienware)",   "ver": "138", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Alienware m16) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"}
             ],
             "firefox": [
-                {"browser": "Firefox 143", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0"},
-                {"browser": "Firefox 138", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0"},
-                {"browser": "Firefox 134", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0"},
-                {"browser": "Firefox 132", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0"}
+                {"browser": "Firefox Default",      "ver": "135", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0"},
+                {"browser": "Firefox 145 (ThinkPad)","ver": "145", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0"},
+                {"browser": "Firefox 143 (Dell XPS)", "ver": "143", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0"},
+                {"browser": "Firefox 141 (Surface)",  "ver": "141", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:141.0) Gecko/20100101 Firefox/141.0"},
+                {"browser": "Firefox 137 (ZenBook)",  "ver": "137", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0"}
             ],
             "opera": [
-                {"browser": "Opera 120", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 OPR/120.0.0.0"},
-                {"browser": "Opera 117", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 OPR/117.0.0.0"},
-                {"browser": "Opera 115", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 OPR/115.0.0.0"}
+                {"browser": "Opera Standard",     "ver": "118", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 OPR/118.0.0.0"},
+                {"browser": "Opera 122 (HP Omen)","ver": "122", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 OPR/122.0.0.0"},
+                {"browser": "Opera 116 (Predator)","ver": "116", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 OPR/116.0.0.0"}
             ]
         },
         "mac": {
             "safari": [
-                {"browser": "Safari 19.2", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.2 Safari/605.1.15"},
-                {"browser": "Safari 19.0", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Safari/605.1.15"},
-                {"browser": "Safari 18.3", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15"},
-                {"browser": "Safari 18.2", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"},
-                {"browser": "Safari 18.1", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15"},
-                {"browser": "Safari 18.0", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"},
-                {"browser": "Safari 17.6", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_9) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"},
-                {"browser": "Safari 17.5", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15"},
-                {"browser": "Safari 17.4", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"}
+                {"browser": "Safari Generic",          "ver": "18.0", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"},
+                {"browser": "Safari 19.4 (MacBook Pro)","ver": "19.4", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_2; MacBookPro18,1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.4 Safari/605.1.15"},
+                {"browser": "Safari 19.2 (MacBook Air)","ver": "19.2", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_1; MacBookAir10,1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.2 Safari/605.1.15"},
+                {"browser": "Safari 19.0 (Mac Studio)", "ver": "19.0", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0; Mac13,2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Safari/605.1.15"},
+                {"browser": "Safari 18.4 (iMac 24)",    "ver": "18.4", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_3; iMac21,1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15"},
+                {"browser": "Safari 18.3 (Mac mini)",   "ver": "18.3", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2; Macmini9,1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15"},
+                {"browser": "Safari 18.2 (MBP M2)",     "ver": "18.2", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7; Mac14,6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"},
+                {"browser": "Safari 18.1 (MBA M2)",     "ver": "18.1", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1; Mac14,2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15"},
+                {"browser": "Safari 17.6 (MBP 16)",     "ver": "17.6", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_9; MacBookPro16,1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"},
+                {"browser": "Safari 17.4 (Intel Mac)",  "ver": "17.4", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"}
             ],
             "chrome": [
-                {"browser": "Chrome 148", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"},
-                {"browser": "Chrome 145", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"},
-                {"browser": "Chrome 139", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"},
-                {"browser": "Chrome 135", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"}
+                {"browser": "Chrome Mac Base",        "ver": "140", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 150 (MacBook Pro)","ver": "150", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_1; Mac15,3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 148 (MacBook Air)","ver": "148", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2; Mac14,15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 145 (Mac Studio)", "ver": "145", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7; Mac14,14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 142 (Mac mini)",   "ver": "142", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1; Mac14,3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 136 (iMac M3)",    "ver": "136", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_9; Mac15,5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"}
             ],
             "firefox": [
-                {"browser": "Firefox 141", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:141.0) Gecko/20100101 Firefox/141.0"},
-                {"browser": "Firefox 136", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:136.0) Gecko/20100101 Firefox/136.0"},
-                {"browser": "Firefox 130", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13.5; rv:130.0) Gecko/20100101 Firefox/130.0"}
+                {"browser": "Firefox Mac Default",     "ver": "135", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0"},
+                {"browser": "Firefox 143 (MacBook Pro)","ver": "143", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15.1; rv:143.0) Gecko/20100101 Firefox/143.0"},
+                {"browser": "Firefox 141 (MacBook Air)","ver": "141", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:141.0) Gecko/20100101 Firefox/141.0"},
+                {"browser": "Firefox 133 (Mac mini)",   "ver": "133", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13.5; rv:133.0) Gecko/20100101 Firefox/133.0"}
             ],
             "edge": [
-                {"browser": "Edge 146", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"},
-                {"browser": "Edge 137", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0"}
+                {"browser": "Edge Mac 148 (MBP M3)","ver": "148", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_1; Mac15,6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"},
+                {"browser": "Edge Mac 144 (MBA M2)","ver": "144", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1; Mac14,2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0"},
+                {"browser": "Edge Mac 138 (iMac)",  "ver": "138", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_9; iMac21,2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"}
             ],
             "opera": [
-                {"browser": "Opera 118", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 OPR/118.0.0.0"},
-                {"browser": "Opera 114", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 OPR/114.0.0.0"}
+                {"browser": "Opera Mac 120 (MBP)", "ver": "120", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_1; Mac14,7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 OPR/120.0.0.0"},
+                {"browser": "Opera Mac 116 (MBA)", "ver": "116", "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1; Mac14,2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 OPR/116.0.0.0"}
             ]
         },
         "linux": {
             "chrome": [
-                {"browser": "Chrome 141", "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"},
-                {"browser": "Chrome 137", "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"},
-                {"browser": "Chrome 133", "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"}
+                {"browser": "Chrome Linux Base",      "ver": "140", "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 149 (Ubuntu 24)", "ver": "149", "ua": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 145 (Fedora 40)", "ver": "145", "ua": "Mozilla/5.0 (X11; Fedora; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 141 (Debian 12)", "ver": "141", "ua": "Mozilla/5.0 (X11; Debian; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"},
+                {"browser": "Chrome 137 (Arch Linux)","ver": "137", "ua": "Mozilla/5.0 (X11; Arch Linux; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"}
             ],
             "firefox": [
-                {"browser": "Firefox 139", "ua": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:139.0) Gecko/20100101 Firefox/139.0"},
-                {"browser": "Firefox 135", "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0"}
+                {"browser": "Firefox Linux",          "ver": "135", "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0"},
+                {"browser": "Firefox 143 (Ubuntu 24)","ver": "143", "ua": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) Gecko/20100101 Firefox/143.0"},
+                {"browser": "Firefox 139 (Fedora 40)","ver": "139", "ua": "Mozilla/5.0 (X11; Fedora; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"},
+                {"browser": "Firefox 135 (Debian 12)","ver": "135", "ua": "Mozilla/5.0 (X11; Debian; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"}
             ],
             "edge": [
-                {"browser": "Edge 141", "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0"}
+                {"browser": "Edge Linux 145 (Ubuntu)","ver": "145", "ua": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"},
+                {"browser": "Edge Linux 139 (Fedora)","ver": "139", "ua": "Mozilla/5.0 (X11; Fedora; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0"}
             ],
             "opera": [
-                {"browser": "Opera 116", "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 OPR/116.0.0.0"}
+                {"browser": "Opera Linux 118 (Ubuntu)","ver": "118", "ua": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 OPR/118.0.0.0"}
             ]
         }
     },
     "mobile": {
         "ios": {
             "safari": [
-                {"browser": "Mobile Safari 19.2", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 19_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.2 Mobile/15E148 Safari/604.1"},
-                {"browser": "Mobile Safari 19.0", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 19_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Mobile/15E148 Safari/604.1"},
-                {"browser": "Mobile Safari 18.3", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"},
-                {"browser": "Mobile Safari 18.2", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1"},
-                {"browser": "Mobile Safari 18.1", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1"},
-                {"browser": "Mobile Safari 18.0", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"},
-                {"browser": "Mobile Safari 17.6", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"},
-                {"browser": "Mobile Safari 17.5", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"},
-                {"browser": "Mobile Safari iPad", "ua": "Mozilla/5.0 (iPad; CPU OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1"}
+                {"browser": "Mobile Safari Generic",       "ver": "18.0", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"},
+                {"browser": "Safari (iPhone 16 Pro Max)",  "ver": "19.4", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 19_4 like Mac OS X; iPhone16,2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.4 Mobile/15E148 Safari/604.1"},
+                {"browser": "Safari (iPhone 16 Plus)",     "ver": "19.2", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 19_2 like Mac OS X; iPhone16,4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.2 Mobile/15E148 Safari/604.1"},
+                {"browser": "Safari (iPhone 15 Pro)",      "ver": "18.4", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X; iPhone15,2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1"},
+                {"browser": "Safari (iPhone 15)",          "ver": "18.2", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X; iPhone15,4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1"},
+                {"browser": "Safari (iPhone 14 Pro Max)",  "ver": "18.1", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X; iPhone14,3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1"},
+                {"browser": "Safari (iPhone 14)",          "ver": "17.6", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X; iPhone14,5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"},
+                {"browser": "Safari (iPhone 13 mini)",     "ver": "17.5", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X; iPhone14,4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"},
+                {"browser": "Safari (iPad Pro 13 M4)",     "ver": "18.3", "ua": "Mozilla/5.0 (iPad; CPU OS 18_3 like Mac OS X; iPad16,3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"},
+                {"browser": "Safari (iPad Air 11 M2)",     "ver": "18.2", "ua": "Mozilla/5.0 (iPad; CPU OS 18_2 like Mac OS X; iPad14,8) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1"}
             ],
             "chrome": [
-                {"browser": "Chrome iOS 149", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 19_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/149.0.0.0 Mobile/15E148 Safari/604.1"},
-                {"browser": "Chrome iOS 145", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/145.0.0.0 Mobile/15E148 Safari/604.1"},
-                {"browser": "Chrome iOS 141", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/141.0.0.0 Mobile/15E148 Safari/604.1"},
-                {"browser": "Chrome iOS 137", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/137.0.0.0 Mobile/15E148 Safari/604.1"}
+                {"browser": "Chrome iOS Base",             "ver": "140", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/140.0.0.0 Mobile/15E148 Safari/604.1"},
+                {"browser": "Chrome iOS (iPhone 16 Pro)",  "ver": "150", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 19_3 like Mac OS X; iPhone16,1) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/150.0.0.0 Mobile/15E148 Safari/604.1"},
+                {"browser": "Chrome iOS (iPhone 15 Pro)",  "ver": "148", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 19_1 like Mac OS X; iPhone15,2) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/148.0.0.0 Mobile/15E148 Safari/604.1"},
+                {"browser": "Chrome iOS (iPhone 14 Plus)", "ver": "145", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X; iPhone14,8) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/145.0.0.0 Mobile/15E148 Safari/604.1"},
+                {"browser": "Chrome iOS (iPhone 13)",      "ver": "141", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X; iPhone14,5) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/141.0.0.0 Mobile/15E148 Safari/604.1"}
             ],
             "firefox": [
-                {"browser": "Firefox iOS 142", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/142.0 Mobile/15E148 Safari/604.1"},
-                {"browser": "Firefox iOS 139", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/139.0 Mobile/15E148 Safari/604.1"},
-                {"browser": "Firefox iOS 136", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/136.0 Mobile/15E148 Safari/604.1"}
+                {"browser": "Firefox iOS Generic",         "ver": "140", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/140.0 Mobile/15E148 Safari/604.1"},
+                {"browser": "Firefox iOS (iPhone 16)",     "ver": "144", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 19_2 like Mac OS X; iPhone16,5) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/144.0 Mobile/15E148 Safari/604.1"},
+                {"browser": "Firefox iOS (iPhone 15)",     "ver": "141", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X; iPhone15,4) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/141.0 Mobile/15E148 Safari/604.1"}
             ],
             "opera": [
-                {"browser": "Opera Touch iOS 6", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) OPT/6.2.0 Mobile/15E148 Safari/604.1"},
-                {"browser": "Opera Touch iOS 5", "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) OPT/5.8.0 Mobile/15E148 Safari/604.1"}
+                {"browser": "Opera Touch (iPhone 16 Pro)", "ver": "7",   "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 19_1 like Mac OS X; iPhone16,1) AppleWebKit/605.1.15 (KHTML, like Gecko) OPT/7.1.0 Mobile/15E148 Safari/604.1"},
+                {"browser": "Opera Touch (iPhone 15)",     "ver": "6",   "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X; iPhone15,4) AppleWebKit/605.1.15 (KHTML, like Gecko) OPT/6.2.0 Mobile/15E148 Safari/604.1"}
             ]
         },
         "android": {
             "chrome": [
-                {"browser": "Chrome Mobile 149", "ua": "Mozilla/5.0 (Linux; Android 15; SM-S938B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36"},
-                {"browser": "Chrome Mobile 148", "ua": "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36"},
-                {"browser": "Chrome Mobile 145", "ua": "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36"},
-                {"browser": "Chrome Mobile 143", "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36"},
-                {"browser": "Chrome Mobile 139", "ua": "Mozilla/5.0 (Linux; Android 13; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"},
-                {"browser": "Chrome Mobile 135", "ua": "Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"}
+                {"browser": "Android 10 K (Default Spec)", "ver": "137", "ua": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Android Generic (No Model)",   "ver": "142", "ua": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Chrome (Galaxy S24 Ultra)",    "ver": "151", "ua": "Mozilla/5.0 (Linux; Android 15; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Chrome (Pixel 9 Pro XL)",      "ver": "150", "ua": "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro XL) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Chrome (Xiaomi 14 Ultra)",     "ver": "149", "ua": "Mozilla/5.0 (Linux; Android 14; 24030PN60G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Chrome (Galaxy S24+)",         "ver": "148", "ua": "Mozilla/5.0 (Linux; Android 15; SM-S926B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Chrome (OnePlus 12)",          "ver": "147", "ua": "Mozilla/5.0 (Linux; Android 14; CPH2581) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Chrome (Pixel 8a)",            "ver": "146", "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Chrome (Galaxy A55 5G)",       "ver": "145", "ua": "Mozilla/5.0 (Linux; Android 14; SM-A556B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Chrome (Redmi Note 13 Pro+)",  "ver": "143", "ua": "Mozilla/5.0 (Linux; Android 13; 23090RA98G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Chrome (POCO F6 Pro)",         "ver": "142", "ua": "Mozilla/5.0 (Linux; Android 14; 23113RKC6G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Chrome (Galaxy Z Fold5)",      "ver": "141", "ua": "Mozilla/5.0 (Linux; Android 14; SM-F946B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36"},
+                {"browser": "Chrome (Moto Edge 50 Ultra)",  "ver": "139", "ua": "Mozilla/5.0 (Linux; Android 14; motorola edge 50 ultra) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"}
             ],
             "firefox": [
-                {"browser": "Firefox Mobile 143", "ua": "Mozilla/5.0 (Android 15; Mobile; rv:143.0) Gecko/143.0 Firefox/143.0"},
-                {"browser": "Firefox Mobile 139", "ua": "Mozilla/5.0 (Android 14; Mobile; rv:139.0) Gecko/139.0 Firefox/139.0"},
-                {"browser": "Firefox Mobile 135", "ua": "Mozilla/5.0 (Android 13; Mobile; rv:135.0) Gecko/135.0 Firefox/135.0"}
+                {"browser": "Firefox Mobile (Pixel 9 Pro)", "ver": "145", "ua": "Mozilla/5.0 (Android 15; Mobile; Pixel 9 Pro; rv:145.0) Gecko/145.0 Firefox/145.0"},
+                {"browser": "Firefox Mobile (Galaxy S24)",  "ver": "142", "ua": "Mozilla/5.0 (Android 15; Mobile; SM-S921B; rv:142.0) Gecko/142.0 Firefox/142.0"},
+                {"browser": "Firefox Mobile (Xiaomi 13T)",  "ver": "139", "ua": "Mozilla/5.0 (Android 14; Mobile; 2306EPN60G; rv:139.0) Gecko/139.0 Firefox/139.0"},
+                {"browser": "Firefox Mobile (Galaxy A54)",  "ver": "138", "ua": "Mozilla/5.0 (Android 14; Mobile; SM-A546B; rv:138.0) Gecko/138.0 Firefox/138.0"}
             ],
             "opera": [
-                {"browser": "Opera Mobile 87", "ua": "Mozilla/5.0 (Linux; Android 15; SM-S938B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Mobile Safari/537.36 OPR/87.0.0.0"},
-                {"browser": "Opera Mobile 85", "ua": "Mozilla/5.0 (Linux; Android 14; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 OPR/85.0.0.0"}
+                {"browser": "Opera Mobile (Galaxy S24 Ultra)","ver": "89", "ua": "Mozilla/5.0 (Linux; Android 15; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36 OPR/89.0.0.0"},
+                {"browser": "Opera Mobile (Pixel 8 Pro)",     "ver": "86", "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36 OPR/86.0.0.0"},
+                {"browser": "Opera Mobile (OnePlus 12)",      "ver": "84", "ua": "Mozilla/5.0 (Linux; Android 14; CPH2581) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36 OPR/84.0.0.0"}
             ]
         }
     }
@@ -218,10 +275,9 @@ UA_DATABASE = {
 
 
 # ---------------------------------------------------------
-# Dynamic Browser & OS Routing Engine
+# Dynamic User-Agent, Platform & Header Synchronization
 # ---------------------------------------------------------
-def pick_user_agent():
-    # 1. Device Selection
+def pick_client_profile():
     if DEVICE_MODE == "desktop":
         device_key = "desktop"
     elif DEVICE_MODE == "mobile":
@@ -229,34 +285,50 @@ def pick_user_agent():
     else:
         device_key = "mobile" if random.random() < 0.60 else "desktop"
 
-    # 2. OS Selection (Desktop: 60% Windows, 33% Mac, 7% Linux | Mobile: 60% Android, 40% iOS)
+    # OS and exact JavaScript navigator.platform mapping
     if device_key == "desktop":
         roll_os = random.random()
         if roll_os < 0.60:
             os_key = "windows"
+            platform_header = '"Windows"'
+            js_platform = "Win32"
         elif roll_os < 0.93:
             os_key = "mac"
+            platform_header = '"macOS"'
+            js_platform = "MacIntel"
         else:
             os_key = "linux"
+            platform_header = '"Linux"'
+            js_platform = "Linux x86_64"
     else:
-        os_key = "android" if random.random() < 0.60 else "ios"
+        if random.random() < 0.60:
+            os_key = "android"
+            platform_header = '"Android"'
+            js_platform = "Linux armv8l"  # Authentic Android JS platform
+        else:
+            os_key = "ios"
+            platform_header = '"iOS"'
+            js_platform = "iPhone"
 
-    # 3. Browser Distribution Rule (Specific to Apple Ecosystem vs Others)
+    if device_key == "desktop":
+        screen_spec = random.choice(SCREEN_RESOLUTIONS["desktop"])
+    else:
+        screen_spec = random.choice(SCREEN_RESOLUTIONS[os_key])
+
+    # Browser Ratio Logic
     if BROWSER_FILTER != "all":
         b_key = BROWSER_FILTER
     else:
         roll_b = random.random()
         if os_key in ("mac", "ios"):
-            # 70% Native Safari, 25% Chrome, 5% Others (Firefox, Opera, Edge)
             if roll_b < 0.70:
                 b_key = "safari"
             elif roll_b < 0.95:
                 b_key = "chrome"
             else:
-                other_choices = [k for k in UA_DATABASE[device_key][os_key].keys() if k not in ("safari", "chrome")]
-                b_key = random.choice(other_choices) if other_choices else "safari"
+                others = [k for k in UA_DATABASE[device_key][os_key].keys() if k not in ("safari", "chrome")]
+                b_key = random.choice(others) if others else "safari"
         else:
-            # Non-Apple platforms (Chrome dominant, Firefox, Edge, Opera)
             if roll_b < 0.65:
                 b_key = "chrome"
             elif roll_b < 0.80:
@@ -266,17 +338,44 @@ def pick_user_agent():
             else:
                 b_key = "opera"
 
-    # Fallback to Chrome if selected browser category does not exist for that specific OS
     os_dict = UA_DATABASE[device_key][os_key]
     if b_key not in os_dict:
         b_key = "chrome" if "chrome" in os_dict else list(os_dict.keys())[0]
 
     selected = random.choice(os_dict[b_key])
-    return device_key.capitalize(), os_key.capitalize(), selected["browser"], selected["ua"]
+    is_mobile_flag = "?1" if device_key == "mobile" else "?0"
+
+    is_chromium = (b_key in ("chrome", "edge", "opera")) and (os_key != "ios")
+    brand_list = ""
+    if is_chromium:
+        v = selected["ver"]
+        if b_key == "chrome":
+            brand_list = f'"Not A(Brand";v="99", "Chromium";v="{v}", "Google Chrome";v="{v}"'
+        elif b_key == "edge":
+            brand_list = f'"Not A(Brand";v="99", "Chromium";v="{v}", "Microsoft Edge";v="{v}"'
+        elif b_key == "opera":
+            brand_list = f'"Not A(Brand";v="99", "Chromium";v="{v}", "Opera";v="{v}"'
+
+    return {
+        "device": device_key.capitalize(),
+        "os": os_key.capitalize(),
+        "browser_engine": b_key,
+        "is_chromium": is_chromium,
+        "brand_list": brand_list,
+        "platform_header": platform_header,
+        "js_platform": js_platform,
+        "is_mobile": is_mobile_flag,
+        "browser_name": selected["browser"],
+        "browser_ver": selected["ver"],
+        "user_agent": selected["ua"],
+        "screen_res": screen_spec["res"],
+        "viewport_w": screen_spec["width"],
+        "viewport_h": screen_spec["height"]
+    }
 
 
 # ---------------------------------------------------------
-# Dynamic Links Resolver (88% Short / 12% Full Rule)
+# Dynamic Links Resolver & Cycle Deduplication
 # ---------------------------------------------------------
 def get_resolved_pools():
     short_pool = []
@@ -306,24 +405,36 @@ def get_resolved_pools():
 
 def pick_cycle_targets(worker_count: int, full_pool: list, short_pool: list):
     targets = []
-    if short_pool and full_pool:
-        for _ in range(worker_count):
-            if random.random() < 0.88:
-                targets.append(random.choice(short_pool))
-            else:
-                targets.append(random.choice(full_pool))
-    elif short_pool:
-        for _ in range(worker_count):
-            targets.append(random.choice(short_pool))
-    elif full_pool:
-        for _ in range(worker_count):
-            targets.append(random.choice(full_pool))
+    available_short = list(short_pool)
+    available_full = list(full_pool)
+
+    for _ in range(worker_count):
+        pick_short = False
+        if available_short and available_full:
+            pick_short = (random.random() < 0.88)
+        elif available_short:
+            pick_short = True
+        elif available_full:
+            pick_short = False
+        else:
+            available_short = list(short_pool)
+            available_full = list(full_pool)
+            pick_short = bool(available_short)
+
+        if pick_short and available_short:
+            chosen = random.choice(available_short)
+            available_short.remove(chosen)
+            targets.append(chosen)
+        elif available_full:
+            chosen = random.choice(available_full)
+            available_full.remove(chosen)
+            targets.append(chosen)
 
     return targets
 
 
 # ---------------------------------------------------------
-# Tor Daemon Management & Native SOCKS5 Client
+# Tor Daemon Management
 # ---------------------------------------------------------
 def start_tor_service():
     tor_cmd = [
@@ -366,127 +477,133 @@ def renew_tor_exit_node():
         return False
 
 
-def socks5_connect(dest_host: str, dest_port: int, proxy_host="127.0.0.1", proxy_port=TOR_SOCKS_PORT, timeout=30):
-    s = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
-    s.sendall(b"\x05\x01\x00")
-    res = s.recv(2)
-    if res != b"\x05\x00":
-        s.close()
-        raise ConnectionError(f"SOCKS5 auth negotiation failed: {res}")
-
-    domain_bytes = dest_host.encode("idna")
-    request = struct.pack("!BBBB", 0x05, 0x01, 0x00, 0x03) + bytes([len(domain_bytes)]) + domain_bytes + struct.pack("!H", dest_port)
-    s.sendall(request)
-
-    response = s.recv(4)
-    if not response or response[1] != 0x00:
-        s.close()
-        raise ConnectionError(f"SOCKS5 connection rejected with code {response[1] if response else 'None'}")
-
-    if response[3] == 0x01:    # IPv4
-        s.recv(6)
-    elif response[3] == 0x03:  # Domain
-        length = s.recv(1)[0]
-        s.recv(length + 2)
-    elif response[3] == 0x04:  # IPv6
-        s.recv(18)
-    return s
-
-
 def get_current_exit_info():
     try:
-        s = socks5_connect("ipwho.is", 80, timeout=10)
-        s.sendall(b"GET / HTTP/1.1\r\nHost: ipwho.is\r\nUser-Agent: curl/7.88.1\r\nConnection: close\r\n\r\n")
-        
-        raw_data = b""
-        while True:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            raw_data += chunk
+        # Use simple HTTP socket over Tor to check the circuit IP
+        s = socket.create_connection(("127.0.0.1", TOR_SOCKS_PORT), timeout=10)
+        s.sendall(b"\x05\x01\x00")
+        s.recv(2)
+        target = b"api.ipify.org"
+        req = struct.pack("!BBBB", 5, 1, 0, 3) + bytes([len(target)]) + target + struct.pack("!H", 80)
+        s.sendall(req)
+        s.recv(10)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
+        data = s.recv(2048).decode("utf-8", errors="ignore").split("\r\n\r\n")[-1].strip()
         s.close()
-
-        body = raw_data.decode("utf-8", errors="ignore").split("\r\n\r\n", 1)[-1]
-        data = json.loads(body)
-        return data.get("ip", "Unknown"), data.get("country_code", "??")
+        return data, "Tor"
     except Exception:
-        try:
-            s = socks5_connect("api.ipify.org", 80, timeout=8)
-            s.sendall(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
-            body = s.recv(2048).decode("utf-8", errors="ignore").split("\r\n\r\n")[-1].strip()
-            s.close()
-            return body, "??"
-        except Exception:
-            return "Unknown", "??"
+        return "Unknown", "??"
 
 
-# ---------------------------------------------------------
-# Worker Execution
-# ---------------------------------------------------------
-def execute_bot(bot_id: int, total_bots: int, target_url: str):
+def get_shifted_circuit(last_ip: str, max_retries=3):
     renew_tor_exit_node()
-    exit_ip, exit_country = get_current_exit_info()
+    exit_ip, country = get_current_exit_info()
+    retries = 0
+    while exit_ip == last_ip and retries < max_retries and exit_ip != "Unknown":
+        time.sleep(1.5)
+        renew_tor_exit_node()
+        exit_ip, country = get_current_exit_info()
+        retries += 1
+    return exit_ip, country
 
-    device_name, os_name, browser_name, user_agent = pick_user_agent()
 
-    parsed = urllib.parse.urlsplit(target_url)
-    host = parsed.hostname
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    path = parsed.path if parsed.path else "/"
-    if parsed.query:
-        path += f"?{parsed.query}"
+# ---------------------------------------------------------
+# Real Browser Automation Engine (Full JavaScript Execution)
+# ---------------------------------------------------------
+async def execute_real_browser_bot(bot_id: int, total_bots: int, target_url: str, last_ip: str, playwright_instance):
+    exit_ip, country = get_shifted_circuit(last_ip)
+    client = pick_client_profile()
 
     chosen_ref = random.choice(REFERRERS)
-    ref_display = "None (Direct)" if chosen_ref.lower() == "none" else chosen_ref
+    if "google" in chosen_ref.lower() or "bing" in chosen_ref.lower():
+        ref_url = random.choice(LANDING_PAGES) if LANDING_PAGES else chosen_ref
+    elif chosen_ref.lower() == "none":
+        ref_url = ""
+    else:
+        ref_url = chosen_ref
 
-    headers = {
-        "Host": host,
-        "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Connection": "close"
+    # Extra headers
+    extra_headers = {
+        "Accept-Language": "en-US,en;q=0.9",
+        "Upgrade-Insecure-Requests": "1"
     }
+    if client["is_chromium"]:
+        extra_headers["Sec-CH-UA"] = client["brand_list"]
+        extra_headers["Sec-CH-UA-Mobile"] = client["is_mobile"]
+        extra_headers["Sec-CH-UA-Platform"] = client["platform_header"]
 
-    if chosen_ref.lower() != "none":
-        headers["Referer"] = chosen_ref
+    # Launch dedicated browser instance routed through Tor
+    browser = await playwright_instance.chromium.launch(
+        headless=True,
+        proxy={"server": f"socks5://127.0.0.1:{TOR_SOCKS_PORT}"},
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars"
+        ]
+    )
+
+    context = await browser.new_context(
+        user_agent=client["user_agent"],
+        viewport={"width": client["viewport_w"], "height": client["viewport_h"]},
+        is_mobile=(client["is_mobile"] == "?1"),
+        has_touch=(client["is_mobile"] == "?1"),
+        extra_http_headers=extra_headers
+    )
+
+    # Injected JavaScript: Overrides platform to realistic string (e.g. 'Linux armv8l')
+    # and masks webdriver flags so it registers as a genuine human device
+    js_patch = f"""
+        Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
+        Object.defineProperty(navigator, 'platform', {{ get: () => '{client["js_platform"]}' }});
+    """
+    await context.add_init_script(js_patch)
+
+    page = await context.new_page()
 
     try:
-        s = socks5_connect(host, port, timeout=30)
-        if parsed.scheme == "https":
-            context = ssl.create_default_context()
-            s = context.wrap_socket(s, server_hostname=host)
+        # Navigate to target page executing real JavaScript
+        response = await page.goto(
+            target_url,
+            referer=ref_url if ref_url else None,
+            timeout=45000,
+            wait_until="domcontentloaded"
+        )
+        status_code = response.status if response else "200 OK"
 
-        req_lines = [f"GET {path} HTTP/1.1"]
-        for k, v in headers.items():
-            req_lines.append(f"{k}: {v}")
-        req_lines.append("\r\n")
-        s.sendall("\r\n".join(req_lines).encode("utf-8"))
+        # Simulate genuine human behavior (reading page and scrolling)
+        await asyncio.sleep(random.uniform(2.5, 5.0))
+        await page.mouse.wheel(0, random.randint(300, 700))
+        await asyncio.sleep(random.uniform(1.5, 3.0))
 
-        raw_resp = s.recv(1024).decode("utf-8", errors="ignore")
-        status_line = raw_resp.split("\r\n")[0] if raw_resp else "NO RESPONSE"
-        s.close()
-
-        print(f"[Bot-{bot_id}/{total_bots}] [Exit: {exit_ip} ({exit_country})] [{device_name}-{os_name} | {browser_name}] [Target: {target_url}] [Ref: {ref_display}] -> {status_line}")
+        ref_display = ref_url if ref_url else "None (Direct)"
+        print(f"[Bot-{bot_id}/{total_bots}] [Exit IP: {exit_ip}] [{client['device']}-{client['os']} | {client['browser_name']} | JS: {client['js_platform']} | {client['screen_res']}] [Target: {target_url}] [Ref: {ref_display}] -> HTTP {status_code} (JS Rendered)")
 
     except Exception as ex:
-        print(f"[Bot-{bot_id}/{total_bots}] [Exit: {exit_ip} ({exit_country})] [{device_name}-{os_name} | {browser_name}] [ERROR]: {str(ex)}")
+        err_msg = str(ex).split("\n")[0][:80]
+        print(f"[Bot-{bot_id}/{total_bots}] [Exit IP: {exit_ip}] [{client['device']}-{client['os']} | {client['browser_name']}] [ERROR]: {err_msg}")
+
+    finally:
+        await context.close()
+        await browser.close()
 
     gap = random.uniform(GAP_MIN, GAP_MAX)
-    time.sleep(gap)
+    await asyncio.sleep(gap)
+    return exit_ip
 
 
 # ---------------------------------------------------------
 # Engine Main Loop
 # ---------------------------------------------------------
-def main():
+async def main_loop():
     print("==================================================")
-    print("   TOR ENGINE (APPLE DEFAULT SAFARI 70/25/5 RULE) ")
+    print("   REAL BROWSER (FULL JS & HUMAN SIMULATION)     ")
     print("==================================================")
     print(f"Device Selection     : {DEVICE_MODE.upper()}")
     print(f"Browser Filter       : {BROWSER_FILTER.upper()}")
     print(f"Include Countries    : {', '.join(FINAL_INCLUDE_COUNTRIES) if FINAL_INCLUDE_COUNTRIES else 'ALL (Default)'}")
     print(f"Exclude Countries    : {', '.join(FINAL_EXCLUDE_COUNTRIES) if FINAL_EXCLUDE_COUNTRIES else 'NONE'}")
-    print(f"Referrers In Pool    : {len(REFERRERS)} (Includes 'none'/direct traffic)")
     print(f"Workers Per Cycle    : {int(WORKER_MIN)} - {int(WORKER_MAX)}")
     print(f"Worker Gap Range     : {GAP_MIN:.1f}s - {GAP_MAX:.1f}s")
     print(f"Cycle Duration Range : {CYCLE_MIN:.1f}s - {CYCLE_MAX:.1f}s")
@@ -495,47 +612,51 @@ def main():
     start_tor_service()
 
     cycle_num = 1
+    last_exit_ip = ""
 
-    try:
-        while True:
-            full_pool, short_pool = get_resolved_pools()
+    async with async_playwright() as playwright:
+        try:
+            while True:
+                full_pool, short_pool = get_resolved_pools()
 
-            if not full_pool and not short_pool:
-                print("----------------------------------------------------------------------")
-                print(" [IDLE WAITING] Please configure target links in Railway:")
-                print(" -> Standard links: LINKS=https://site1.com,https://site2.com")
-                print(" -> (Optional) Short links: BASE_URL=https://site.com & SHORT_LINKS=s1,s2")
-                print(" Checking again in 20s...")
-                print("----------------------------------------------------------------------\n")
-                time.sleep(20)
-                continue
+                if not full_pool and not short_pool:
+                    print("----------------------------------------------------------------------")
+                    print(" [IDLE WAITING] Please configure target links in Railway:")
+                    print(" -> LINKS=https://site1.com,https://site2.com")
+                    print(" -> (Optional) BASE_URL=https://site.com & SHORT_LINKS=s1,s2")
+                    print(" Checking again in 20s...")
+                    print("----------------------------------------------------------------------\n")
+                    await asyncio.sleep(20)
+                    continue
 
-            cycle_start = time.time()
-            worker_count = random.randint(int(WORKER_MIN), int(WORKER_MAX))
-            target_cycle_time = random.uniform(CYCLE_MIN, CYCLE_MAX)
+                cycle_start = time.time()
+                worker_count = random.randint(int(WORKER_MIN), int(WORKER_MAX))
+                target_cycle_time = random.uniform(CYCLE_MIN, CYCLE_MAX)
 
-            cycle_links = pick_cycle_targets(worker_count, full_pool, short_pool)
+                cycle_links = pick_cycle_targets(worker_count, full_pool, short_pool)
 
-            print(f"\n--- [Cycle #{cycle_num}] Starting {len(cycle_links)} bots (Full: {len(full_pool)}, Short: {len(short_pool)}) | Target: {target_cycle_time:.1f}s ---")
+                print(f"\n--- [Cycle #{cycle_num}] Starting {len(cycle_links)} real browser bots | Target: {target_cycle_time:.1f}s ---")
 
-            for idx, target_url in enumerate(cycle_links, start=1):
-                execute_bot(idx, len(cycle_links), target_url)
+                for idx, target_url in enumerate(cycle_links, start=1):
+                    last_exit_ip = await execute_real_browser_bot(
+                        idx, len(cycle_links), target_url, last_exit_ip, playwright
+                    )
 
-            elapsed = time.time() - cycle_start
-            wait_time = target_cycle_time - elapsed
+                elapsed = time.time() - cycle_start
+                wait_time = target_cycle_time - elapsed
 
-            if wait_time > 0:
-                print(f"--- [Cycle #{cycle_num} Complete] Elapsed: {elapsed:.1f}s | Pausing {wait_time:.1f}s before next cycle ---")
-                time.sleep(wait_time)
-            else:
-                print(f"--- [Cycle #{cycle_num} Complete] Elapsed: {elapsed:.1f}s | Starting next cycle immediately ---")
+                if wait_time > 0:
+                    print(f"--- [Cycle #{cycle_num} Complete] Elapsed: {elapsed:.1f}s | Pausing {wait_time:.1f}s before next cycle ---")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"--- [Cycle #{cycle_num} Complete] Elapsed: {elapsed:.1f}s | Starting next cycle immediately ---")
 
-            cycle_num += 1
+                cycle_num += 1
 
-    except KeyboardInterrupt:
-        print("\nEngine stopped.")
-        sys.exit(0)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            print("\nEngine stopped.")
+            sys.exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_loop())
