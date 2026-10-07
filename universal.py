@@ -25,7 +25,7 @@ def parse_range(var_name: str, default_min: float, default_max: float):
             val = float(parts[0])
             return val, val
     except ValueError:
-        print(f"[WARN] Invalid range in '{var_name}' ('{raw_val}'). Using defaults ({default_min}, {default_max}).")
+        print(f"[WARN] Invalid range in '{var_name}' ('{raw_val}'). Using defaults ({default_min}, {default_max}).", flush=True)
     return default_min, default_max
 
 
@@ -113,7 +113,7 @@ SCREEN_RESOLUTIONS = {
 
 
 # ---------------------------------------------------------
-# Comprehensive User-Agent Database (Rich Hardware Models)
+# Comprehensive User-Agent Database
 # ---------------------------------------------------------
 UA_DATABASE = {
     "desktop": {
@@ -148,7 +148,7 @@ UA_DATABASE = {
             "opera": [
                 {"browser": "Opera Standard",     "ver": "118", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 OPR/118.0.0.0"},
                 {"browser": "Opera 122 (HP Omen)","ver": "122", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 OPR/122.0.0.0"},
-                {"browser": "Opera 116 (Predator)","ver": "116", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Acer Predator) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 OPR/116.0.0.0"}
+                {"browser": "Opera 116 (Predator)","ver": "116", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 OPR/116.0.0.0"}
             ]
         },
         "mac": {
@@ -448,10 +448,10 @@ def start_tor_service():
 
     try:
         subprocess.run(tor_cmd, check=True)
-        print("[TOR] Service started. Waiting for circuit initialization...")
+        print("[TOR] Service started. Waiting for circuit initialization...", flush=True)
         time.sleep(6)
     except Exception as e:
-        print(f"[TOR CRITICAL] Failed to execute Tor binary: {e}")
+        print(f"[TOR CRITICAL] Failed to execute Tor binary: {e}", flush=True)
         sys.exit(1)
 
 
@@ -555,13 +555,16 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, last_country: str
     if "google" in chosen_ref.lower() or "bing" in chosen_ref.lower():
         if LANDING_PAGES:
             chosen_ref = random.choice(LANDING_PAGES)
-            ref_display = f"Bridge ({chosen_ref})"
+            ref_display = f"Bridge ({chosen_ref[:18]}...{chosen_ref[-6:]})"
         else:
             ref_display = chosen_ref
     elif chosen_ref.lower() == "none":
         ref_display = "None (Direct)"
     else:
-        ref_display = chosen_ref
+        ref_display = f"{chosen_ref[:16]}...{chosen_ref[-6:]}" if len(chosen_ref) > 25 else chosen_ref
+
+    # Compact inline link display: start and end characters
+    masked_target = f"{target_url[:22]}...{target_url[-8:]}" if len(target_url) > 34 else target_url
 
     # 1. Base Headers
     headers = {
@@ -607,10 +610,10 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, last_country: str
         status_line = raw_resp.split("\r\n")[0] if raw_resp else "NO RESPONSE"
         s.close()
 
-        print(f"[Bot-{bot_id}/{total_bots}] [Exit: {exit_ip} ({exit_country})] [{client['device']}-{client['os']} | {client['browser_name']} | {client['screen_res']}] [Target: {target_url}] [Ref: {ref_display}] -> {status_line}")
+        print(f"[Bot-{bot_id}/{total_bots}] [Exit: {exit_ip} ({exit_country})] [{client['device']}-{client['os']} | {client['browser_name']} | {client['screen_res']}] [Target: {masked_target}] [Ref: {ref_display}] -> {status_line}", flush=True)
 
     except Exception as ex:
-        print(f"[Bot-{bot_id}/{total_bots}] [Exit: {exit_ip} ({exit_country})] [{client['device']}-{client['os']} | {client['browser_name']} | {client['screen_res']}] [ERROR]: {str(ex)}")
+        print(f"[Bot-{bot_id}/{total_bots}] [Exit: {exit_ip} ({exit_country})] [{client['device']}-{client['os']} | {client['browser_name']} | {client['screen_res']}] [Target: {masked_target}] [ERROR]: {str(ex)}", flush=True)
 
     gap = random.uniform(GAP_MIN, GAP_MAX)
     time.sleep(gap)
@@ -621,17 +624,17 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, last_country: str
 # Engine Main Loop
 # ---------------------------------------------------------
 def main():
-    print("==================================================")
-    print("  TOR ROTATION ENGINE (AUTHENTIC HARDWARE MODELS) ")
-    print("==================================================")
-    print(f"Device Selection     : {DEVICE_MODE.upper()}")
-    print(f"Browser Filter       : {BROWSER_FILTER.upper()}")
-    print(f"Include Countries    : {', '.join(FINAL_INCLUDE_COUNTRIES) if FINAL_INCLUDE_COUNTRIES else 'ALL (Default)'}")
-    print(f"Exclude Countries    : {', '.join(FINAL_EXCLUDE_COUNTRIES) if FINAL_EXCLUDE_COUNTRIES else 'NONE'}")
-    print(f"Workers Per Cycle    : {int(WORKER_MIN)} - {int(WORKER_MAX)}")
-    print(f"Worker Gap Range     : {GAP_MIN:.1f}s - {GAP_MAX:.1f}s")
-    print(f"Cycle Duration Range : {CYCLE_MIN:.1f}s - {CYCLE_MAX:.1f}s")
-    print("==================================================\n")
+    print("==================================================", flush=True)
+    print("  TOR ROTATION ENGINE (AUTHENTIC HARDWARE MODELS) ", flush=True)
+    print("==================================================", flush=True)
+    print(f"Device Selection     : {DEVICE_MODE.upper()}", flush=True)
+    print(f"Browser Filter       : {BROWSER_FILTER.upper()}", flush=True)
+    print(f"Include Countries    : {', '.join(FINAL_INCLUDE_COUNTRIES) if FINAL_INCLUDE_COUNTRIES else 'ALL (Default)'}", flush=True)
+    print(f"Exclude Countries    : {', '.join(FINAL_EXCLUDE_COUNTRIES) if FINAL_EXCLUDE_COUNTRIES else 'NONE'}", flush=True)
+    print(f"Workers Per Cycle    : {int(WORKER_MIN)} - {int(WORKER_MAX)}", flush=True)
+    print(f"Worker Gap Range     : {GAP_MIN:.1f}s - {GAP_MAX:.1f}s", flush=True)
+    print(f"Cycle Duration Range : {CYCLE_MIN:.1f}s - {CYCLE_MAX:.1f}s", flush=True)
+    print("==================================================\n", flush=True)
 
     start_tor_service()
 
@@ -643,12 +646,12 @@ def main():
             full_pool, short_pool = get_resolved_pools()
 
             if not full_pool and not short_pool:
-                print("----------------------------------------------------------------------")
-                print(" [IDLE WAITING] Please configure target links in Railway:")
-                print(" -> Standard links: LINKS=https://site1.com,https://site2.com")
-                print(" -> (Optional) Short links: BASE_URL=https://site.com & SHORT_LINKS=s1,s2")
-                print(" Checking again in 20s...")
-                print("----------------------------------------------------------------------\n")
+                print("----------------------------------------------------------------------", flush=True)
+                print(" [IDLE WAITING] Please configure target links in Railway:", flush=True)
+                print(" -> Standard links: LINKS=https://site1.com,https://site2.com", flush=True)
+                print(" -> (Optional) Short links: BASE_URL=https://site.com & SHORT_LINKS=s1,s2", flush=True)
+                print(" Checking again in 20s...", flush=True)
+                print("----------------------------------------------------------------------\n", flush=True)
                 time.sleep(20)
                 continue
 
@@ -658,7 +661,7 @@ def main():
 
             cycle_links = pick_cycle_targets(worker_count, full_pool, short_pool)
 
-            print(f"\n--- [Cycle #{cycle_num}] Starting {len(cycle_links)} bots | Target Cycle Time: {target_cycle_time:.1f}s ---")
+            print(f"\n--- [Cycle #{cycle_num} Started] Dispatching {len(cycle_links)} bots | Target Interval: {target_cycle_time:.1f}s ---", flush=True)
 
             for idx, target_url in enumerate(cycle_links, start=1):
                 last_exit_country = execute_bot(idx, len(cycle_links), target_url, last_exit_country)
@@ -667,15 +670,15 @@ def main():
             wait_time = target_cycle_time - elapsed
 
             if wait_time > 0:
-                print(f"--- [Cycle #{cycle_num} Complete] Elapsed: {elapsed:.1f}s | Pausing {wait_time:.1f}s before next cycle ---")
+                print(f"--- [Cycle #{cycle_num} Complete] Duration: {elapsed:.1f}s | Pausing {wait_time:.1f}s before Cycle #{cycle_num + 1} ---", flush=True)
                 time.sleep(wait_time)
             else:
-                print(f"--- [Cycle #{cycle_num} Complete] Elapsed: {elapsed:.1f}s | Starting next cycle immediately ---")
+                print(f"--- [Cycle #{cycle_num} Complete] Duration: {elapsed:.1f}s | Starting Cycle #{cycle_num + 1} immediately ---", flush=True)
 
             cycle_num += 1
 
     except KeyboardInterrupt:
-        print("\nEngine stopped.")
+        print("\nEngine stopped.", flush=True)
         sys.exit(0)
 
 
