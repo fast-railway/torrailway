@@ -1,18 +1,18 @@
-import asyncio
 from datetime import datetime
 import json
 import os
+import re
 import random
 import socket
+import ssl
 import struct
 import subprocess
 import sys
 import time
 import urllib.parse
-from playwright.async_api import async_playwright
 
 # ---------------------------------------------------------
-# Environment Parsers & Configuration
+# Environment Parsers & Universal Case-Insensitive Matching
 # ---------------------------------------------------------
 def parse_range(var_name: str, default_min: float, default_max: float):
     raw_val = os.getenv(var_name, "").strip()
@@ -38,28 +38,25 @@ def parse_list(var_name: str, defaults: list):
     return items if items else defaults
 
 
+# Execution settings: 2-6 bots per cycle, 50-70s interval
 WORKER_MIN, WORKER_MAX = parse_range("WORKER_COUNT_RANGE", 2, 6)
 GAP_MIN, GAP_MAX = parse_range("WORKER_GAP_RANGE", 6.0, 12.0)
 CYCLE_MIN, CYCLE_MAX = parse_range("CYCLE_INTERVAL_RANGE", 50.0, 70.0)
 
+# Quick exclusions ("1" excludes that entire device type)
 EXCLUDE_DESKTOP = os.getenv("EXCLUDE_DESKTOP", "").strip() == "1"
 EXCLUDE_MOBILE = os.getenv("EXCLUDE_MOBILE", "").strip() == "1"
 
-RAW_DEVICE_TYPE = os.getenv("DEVICE_TYPE", "both").strip().lower()
-if RAW_DEVICE_TYPE == "desktop" or EXCLUDE_MOBILE:
-    DEVICE_MODE = "desktop"
-elif RAW_DEVICE_TYPE == "mobile" or EXCLUDE_DESKTOP:
-    DEVICE_MODE = "mobile"
-else:
-    DEVICE_MODE = "both"
-
+# Case-insensitive browser filter
 BROWSER_FILTER = os.getenv("BROWSER_FILTER", "all").strip().lower()
 
+# Country Filter Logic (Universal Case-Insensitive)
 RAW_INCLUDE_COUNTRIES = [c.upper() for c in parse_list("INCLUDE_COUNTRIES", [])]
 RAW_EXCLUDE_COUNTRIES = [c.upper() for c in parse_list("EXCLUDE_COUNTRIES", [])]
 FINAL_EXCLUDE_COUNTRIES = set(RAW_EXCLUDE_COUNTRIES)
 FINAL_INCLUDE_COUNTRIES = [c for c in RAW_INCLUDE_COUNTRIES if c not in FINAL_EXCLUDE_COUNTRIES]
 
+# Referrers Pool with natural direct traffic weighting
 DEFAULT_REFERRERS = [
     "none",
     "https://t.co/",
@@ -75,6 +72,70 @@ LANDING_PAGES = parse_list("LANDING_PAGES", [])
 
 TOR_SOCKS_PORT = 9050
 TOR_CONTROL_PORT = 9051
+
+
+# ---------------------------------------------------------
+# Dynamic DEVICE_TYPE Parser with Curly-Brace OS Syntax
+# ---------------------------------------------------------
+def parse_device_rules():
+    """
+    Parses complex case-insensitive DEVICE_TYPE strings, including:
+      - 'mobile, desktop' or 'both'
+      - 'mobile{android}, desktop{windows}'
+      - 'mobile{ios,android}, desktop{mac,linux}'
+      - 'desktop{windows}'
+    """
+    raw_input = os.getenv("DEVICE_TYPE", "both").strip().lower()
+    
+    # Check simple exclusion flags first
+    if EXCLUDE_DESKTOP and not EXCLUDE_MOBILE:
+        raw_input = "mobile"
+    elif EXCLUDE_MOBILE and not EXCLUDE_DESKTOP:
+        raw_input = "desktop"
+
+    allowed_pairs = []  # List of tuples: (device, os)
+
+    if raw_input in ("both", "", "*"):
+        allowed_pairs.extend([("mobile", "android"), ("mobile", "ios")])
+        allowed_pairs.extend([("desktop", "windows"), ("desktop", "mac"), ("desktop", "linux")])
+        return allowed_pairs
+
+    # Regex matches: category optionally followed by {os1,os2}
+    pattern = re.compile(r"([a-z]+)(?:\{([a-z0-9,\s]+)\})?")
+    tokens = pattern.findall(raw_input)
+
+    for dev_raw, os_group in tokens:
+        dev = dev_raw.strip()
+        if dev == "both":
+            allowed_pairs.extend([("mobile", "android"), ("mobile", "ios")])
+            allowed_pairs.extend([("desktop", "windows"), ("desktop", "mac"), ("desktop", "linux")])
+            continue
+
+        if dev in ("mobile", "desktop"):
+            if os_group:
+                # Specific OS list provided inside braces
+                specified_os = [x.strip() for x in os_group.split(",") if x.strip()]
+                for o in specified_os:
+                    allowed_pairs.append((dev, o))
+            else:
+                # Bare category provided: allow all OS variations for this device
+                if dev == "mobile":
+                    allowed_pairs.extend([("mobile", "android"), ("mobile", "ios")])
+                elif dev == "desktop":
+                    allowed_pairs.extend([("desktop", "windows"), ("desktop", "mac"), ("desktop", "linux")])
+
+    # Safe fallback if input string is unparseable or malformed
+    if not allowed_pairs:
+        allowed_pairs = [
+            ("mobile", "android"), ("mobile", "ios"),
+            ("desktop", "windows"), ("desktop", "mac"), ("desktop", "linux")
+        ]
+
+    # Deduplicate entries
+    return list(dict.fromkeys(allowed_pairs))
+
+
+CONFIGURED_DEVICE_POOLS = parse_device_rules()
 
 
 # ---------------------------------------------------------
@@ -145,7 +206,7 @@ UA_DATABASE = {
             "opera": [
                 {"browser": "Opera Standard",     "ver": "118", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 OPR/118.0.0.0"},
                 {"browser": "Opera 122 (HP Omen)","ver": "122", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 OPR/122.0.0.0"},
-                {"browser": "Opera 116 (Predator)","ver": "116", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Acer Predator) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 OPR/116.0.0.0"}
+                {"browser": "Opera 116 (Predator)","ver": "116", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Acer Predator) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 OPR/116.0.0.0"}
             ]
         },
         "mac": {
@@ -272,67 +333,31 @@ UA_DATABASE = {
 
 
 # ---------------------------------------------------------
-# Dynamic Hardware & Navigator Sync
+# Dynamic User-Agent, Platform & Header Synchronization
 # ---------------------------------------------------------
 def pick_client_profile():
-    if DEVICE_MODE == "desktop":
-        device_key = "desktop"
-    elif DEVICE_MODE == "mobile":
-        device_key = "mobile"
-    else:
-        device_key = "mobile" if random.random() < 0.60 else "desktop"
+    # Pick a valid (device, os) pair directly from the parsed DEVICE_TYPE pool
+    device_key, os_key = random.choice(CONFIGURED_DEVICE_POOLS)
 
-    # OS, platform string, and hardware specs
-    if device_key == "desktop":
-        roll_os = random.random()
-        if roll_os < 0.60:
-            os_key = "windows"
-            platform_header = '"Windows"'
-            js_platform = "Win32"
-            ram = random.choice([8, 16, 32])
-            cores = random.choice([4, 8, 12, 16])
-            gl_vendor = "Google Inc. (NVIDIA)"
-            gl_renderer = "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"
-        elif roll_os < 0.93:
-            os_key = "mac"
-            platform_header = '"macOS"'
-            js_platform = "MacIntel"
-            ram = random.choice([8, 16, 24])
-            cores = random.choice([8, 10, 12])
-            gl_vendor = "Apple"
-            gl_renderer = "Apple M2"
-        else:
-            os_key = "linux"
-            platform_header = '"Linux"'
-            js_platform = "Linux x86_64"
-            ram = random.choice([8, 16])
-            cores = random.choice([4, 8])
-            gl_vendor = "Google Inc. (AMD)"
-            gl_renderer = "ANGLE (AMD, AMD Radeon RX 6600, OpenGL 4.6)"
+    # Standard W3C platform header mapping
+    if os_key == "windows":
+        platform_header = '"Windows"'
+    elif os_key == "mac":
+        platform_header = '"macOS"'
+    elif os_key == "android":
+        platform_header = '"Android"'
+    elif os_key == "ios":
+        platform_header = '"iOS"'
     else:
-        if random.random() < 0.60:
-            os_key = "android"
-            platform_header = '"Android"'
-            js_platform = "Linux armv8l"  # Real Android hardware architecture
-            ram = random.choice([6, 8, 12])
-            cores = 8
-            gl_vendor = "Qualcomm"
-            gl_renderer = "Adreno (TM) 740"
-        else:
-            os_key = "ios"
-            platform_header = '"iOS"'
-            js_platform = "iPhone"
-            ram = random.choice([6, 8])
-            cores = 6
-            gl_vendor = "Apple Inc."
-            gl_renderer = "Apple GPU"
+        platform_header = '"Linux"'
 
+    # Screen resolution mapping
     if device_key == "desktop":
         screen_spec = random.choice(SCREEN_RESOLUTIONS["desktop"])
     else:
         screen_spec = random.choice(SCREEN_RESOLUTIONS[os_key])
 
-    # Browser Engine Choice
+    # Browser filter & weighting
     if BROWSER_FILTER != "all":
         b_key = BROWSER_FILTER
     else:
@@ -380,11 +405,6 @@ def pick_client_profile():
         "is_chromium": is_chromium,
         "brand_list": brand_list,
         "platform_header": platform_header,
-        "js_platform": js_platform,
-        "ram": ram,
-        "cores": cores,
-        "gl_vendor": gl_vendor,
-        "gl_renderer": gl_renderer,
         "is_mobile": is_mobile_flag,
         "browser_name": selected["browser"],
         "browser_ver": selected["ver"],
@@ -455,7 +475,7 @@ def pick_cycle_targets(worker_count: int, full_pool: list, short_pool: list):
 
 
 # ---------------------------------------------------------
-# Tor Daemon Management
+# Tor Daemon Management & SOCKS5 Client
 # ---------------------------------------------------------
 def start_tor_service():
     tor_cmd = [
@@ -498,143 +518,162 @@ def renew_tor_exit_node():
         return False
 
 
+def socks5_connect(dest_host: str, dest_port: int, proxy_host="127.0.0.1", proxy_port=TOR_SOCKS_PORT, timeout=30):
+    s = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    s.sendall(b"\x05\x01\x00")
+    res = s.recv(2)
+    if res != b"\x05\x00":
+        s.close()
+        raise ConnectionError(f"SOCKS5 auth negotiation failed: {res}")
+
+    domain_bytes = dest_host.encode("idna")
+    request = struct.pack("!BBBB", 0x05, 0x01, 0x00, 0x03) + bytes([len(domain_bytes)]) + domain_bytes + struct.pack("!H", dest_port)
+    s.sendall(request)
+
+    response = s.recv(4)
+    if not response or response[1] != 0x00:
+        s.close()
+        raise ConnectionError(f"SOCKS5 connection rejected with code {response[1] if response else 'None'}")
+
+    if response[3] == 0x01:    # IPv4
+        s.recv(6)
+    elif response[3] == 0x03:  # Domain
+        length = s.recv(1)[0]
+        s.recv(length + 2)
+    elif response[3] == 0x04:  # IPv6
+        s.recv(18)
+    return s
+
+
 def get_current_exit_info():
     try:
-        s = socket.create_connection(("127.0.0.1", TOR_SOCKS_PORT), timeout=10)
-        s.sendall(b"\x05\x01\x00")
-        s.recv(2)
-        target = b"api.ipify.org"
-        req = struct.pack("!BBBB", 5, 1, 0, 3) + bytes([len(target)]) + target + struct.pack("!H", 80)
-        s.sendall(req)
-        s.recv(10)
-        s.sendall(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
-        data = s.recv(2048).decode("utf-8", errors="ignore").split("\r\n\r\n")[-1].strip()
+        s = socks5_connect("ipwho.is", 80, timeout=10)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: ipwho.is\r\nUser-Agent: curl/7.88.1\r\nConnection: close\r\n\r\n")
+        
+        raw_data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            raw_data += chunk
         s.close()
-        return data, "Tor"
+
+        body = raw_data.decode("utf-8", errors="ignore").split("\r\n\r\n", 1)[-1]
+        data = json.loads(body)
+        return data.get("ip", "Unknown"), data.get("country_code", "??")
     except Exception:
-        return "Unknown", "??"
+        try:
+            s = socks5_connect("api.ipify.org", 80, timeout=8)
+            s.sendall(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
+            body = s.recv(2048).decode("utf-8", errors="ignore").split("\r\n\r\n")[-1].strip()
+            s.close()
+            return body, "??"
+        except Exception:
+            return "Unknown", "??"
 
 
-def get_shifted_circuit(last_ip: str, max_retries=3):
+def get_shifted_circuit(last_country: str, max_retries=3):
     renew_tor_exit_node()
-    exit_ip, country = get_current_exit_info()
+    exit_ip, exit_country = get_current_exit_info()
+
     retries = 0
-    while exit_ip == last_ip and retries < max_retries and exit_ip != "Unknown":
-        time.sleep(1.5)
+    while exit_country == last_country and retries < max_retries and exit_country != "??":
+        time.sleep(1.2)
         renew_tor_exit_node()
-        exit_ip, country = get_current_exit_info()
+        exit_ip, exit_country = get_current_exit_info()
         retries += 1
-    return exit_ip, country
+
+    return exit_ip, exit_country
 
 
 # ---------------------------------------------------------
-# Real Browser Automation Engine (Full Real-User JavaScript)
+# Worker Execution
 # ---------------------------------------------------------
-async def execute_real_browser_bot(bot_id: int, total_bots: int, target_url: str, last_ip: str, playwright_instance):
-    exit_ip, country = get_shifted_circuit(last_ip)
+def execute_bot(bot_id: int, total_bots: int, target_url: str, last_country: str):
+    exit_ip, exit_country = get_shifted_circuit(last_country)
     client = pick_client_profile()
+
+    parsed = urllib.parse.urlsplit(target_url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path if parsed.path else "/"
+    if parsed.query:
+        path += f"?{parsed.query}"
 
     chosen_ref = random.choice(REFERRERS)
     if "google" in chosen_ref.lower() or "bing" in chosen_ref.lower():
-        ref_url = random.choice(LANDING_PAGES) if LANDING_PAGES else chosen_ref
+        if LANDING_PAGES:
+            chosen_ref = random.choice(LANDING_PAGES)
+            ref_display = f"Bridge ({chosen_ref[:18]}...{chosen_ref[-6:]})"
+        else:
+            ref_display = chosen_ref
     elif chosen_ref.lower() == "none":
-        ref_url = ""
+        ref_display = "None (Direct)"
     else:
-        ref_url = chosen_ref
+        ref_display = f"{chosen_ref[:16]}...{chosen_ref[-6:]}" if len(chosen_ref) > 25 else chosen_ref
 
     masked_target = f"{target_url[:22]}...{target_url[-8:]}" if len(target_url) > 34 else target_url
-    ref_display = f"{ref_url[:18]}...{ref_url[-6:]}" if len(ref_url) > 28 else (ref_url or "None (Direct)")
 
-    extra_headers = {
+    headers = {
+        "Host": host,
+        "User-Agent": client["user_agent"],
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Upgrade-Insecure-Requests": "1"
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "close"
     }
+
     if client["is_chromium"]:
-        extra_headers["Sec-CH-UA"] = client["brand_list"]
-        extra_headers["Sec-CH-UA-Mobile"] = client["is_mobile"]
-        extra_headers["Sec-CH-UA-Platform"] = client["platform_header"]
+        headers["Sec-CH-UA"] = client["brand_list"]
+        headers["Sec-CH-UA-Mobile"] = client["is_mobile"]
+        headers["Sec-CH-UA-Platform"] = client["platform_header"]
+        headers["Sec-CH-Viewport-Width"] = str(client["viewport_w"])
+        headers["Sec-Fetch-Dest"] = "document"
+        headers["Sec-Fetch-Mode"] = "navigate"
+        headers["Sec-Fetch-Site"] = "cross-site" if chosen_ref.lower() != "none" else "none"
+        headers["Sec-Fetch-User"] = "?1"
+    else:
+        headers["Sec-Fetch-Dest"] = "document"
+        headers["Sec-Fetch-Mode"] = "navigate"
+        headers["Sec-Fetch-Site"] = "cross-site" if chosen_ref.lower() != "none" else "none"
 
-    # Launch genuine Chromium process through Tor socks5
-    browser = await playwright_instance.chromium.launch(
-        headless=True,
-        proxy={"server": f"socks5://127.0.0.1:{TOR_SOCKS_PORT}"},
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-infobars"
-        ]
-    )
-
-    context = await browser.new_context(
-        user_agent=client["user_agent"],
-        viewport={"width": client["viewport_w"], "height": client["viewport_h"]},
-        is_mobile=(client["is_mobile"] == "?1"),
-        has_touch=(client["is_mobile"] == "?1"),
-        extra_http_headers=extra_headers
-    )
-
-    # Injected Pre-Navigation JavaScript: Overrides platform, RAM, cores, WebGL & hides automation flags
-    js_patch = f"""
-        // 1. Delete webdriver fingerprint
-        Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
-
-        // 2. Override platform to genuine hardware spec (e.g. 'Linux armv8l', 'Win32', 'MacIntel')
-        Object.defineProperty(navigator, 'platform', {{ get: () => '{client["js_platform"]}' }});
-
-        // 3. Hardware specifications (RAM and CPU cores)
-        Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {client["ram"]} }});
-        Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {client["cores"]} }});
-
-        // 4. Spoof WebGL Vendor and GPU Renderer
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {{
-            if (parameter === 37445) return '{client["gl_vendor"]}';
-            if (parameter === 37446) return '{client["gl_renderer"]}';
-            return getParameter.apply(this, arguments);
-        }};
-    """
-    await context.add_init_script(js_patch)
-
-    page = await context.new_page()
+    if chosen_ref.lower() != "none":
+        headers["Referer"] = chosen_ref
 
     try:
-        response = await page.goto(
-            target_url,
-            referer=ref_url if ref_url else None,
-            timeout=45000,
-            wait_until="domcontentloaded"
-        )
-        status_code = response.status if response else "200 OK"
+        s = socks5_connect(host, port, timeout=30)
+        if parsed.scheme == "https":
+            context = ssl.create_default_context()
+            s = context.wrap_socket(s, server_hostname=host)
 
-        # Natural human delay and interaction
-        await asyncio.sleep(random.uniform(2.5, 4.5))
-        await page.mouse.wheel(0, random.randint(300, 650))
-        await asyncio.sleep(random.uniform(1.5, 3.0))
+        req_lines = [f"GET {path} HTTP/1.1"]
+        for k, v in headers.items():
+            req_lines.append(f"{k}: {v}")
+        req_lines.append("\r\n")
+        s.sendall("\r\n".join(req_lines).encode("utf-8"))
 
-        print(f"[Bot-{bot_id}/{total_bots}] [Exit: {exit_ip}] [{client['device']}-{client['os']} | {client['browser_name']} | JS: {client['js_platform']} | RAM: {client['ram']}GB | {client['screen_res']}] [Target: {masked_target}] [Ref: {ref_display}] -> HTTP {status_code} (JS Active)", flush=True)
+        raw_resp = s.recv(1024).decode("utf-8", errors="ignore")
+        status_line = raw_resp.split("\r\n")[0] if raw_resp else "NO RESPONSE"
+        s.close()
+
+        print(f"[Bot-{bot_id}/{total_bots}] [Exit: {exit_ip} ({exit_country})] [{client['device']}-{client['os']} | {client['browser_name']} | {client['screen_res']}] [Target: {masked_target}] [Ref: {ref_display}] -> {status_line}", flush=True)
 
     except Exception as ex:
-        err_msg = str(ex).split("\n")[0][:80]
-        print(f"[Bot-{bot_id}/{total_bots}] [Exit: {exit_ip}] [{client['device']}-{client['os']} | {client['browser_name']}] [Target: {masked_target}] [ERROR]: {err_msg}", flush=True)
-
-    finally:
-        await context.close()
-        await browser.close()
+        print(f"[Bot-{bot_id}/{total_bots}] [Exit: {exit_ip} ({exit_country})] [{client['device']}-{client['os']} | {client['browser_name']} | {client['screen_res']}] [Target: {masked_target}] [ERROR]: {str(ex)}", flush=True)
 
     gap = random.uniform(GAP_MIN, GAP_MAX)
-    await asyncio.sleep(gap)
-    return exit_ip
+    time.sleep(gap)
+    return exit_country
 
 
 # ---------------------------------------------------------
 # Engine Main Loop
 # ---------------------------------------------------------
-async def main_loop():
+def main():
     print("==================================================", flush=True)
-    print("  TOR ENGINE (REAL PLAYWRIGHT BROWSER & FULL JS)  ", flush=True)
+    print("  TOR ROTATION ENGINE (ADVANCED DEVICE TARGETING) ", flush=True)
     print("==================================================", flush=True)
-    print(f"Device Selection     : {DEVICE_MODE.upper()}", flush=True)
+    print(f"Active Device Pools  : {CONFIGURED_DEVICE_POOLS}", flush=True)
     print(f"Browser Filter       : {BROWSER_FILTER.upper()}", flush=True)
     print(f"Include Countries    : {', '.join(FINAL_INCLUDE_COUNTRIES) if FINAL_INCLUDE_COUNTRIES else 'ALL (Default)'}", flush=True)
     print(f"Exclude Countries    : {', '.join(FINAL_EXCLUDE_COUNTRIES) if FINAL_EXCLUDE_COUNTRIES else 'NONE'}", flush=True)
@@ -646,51 +685,48 @@ async def main_loop():
     start_tor_service()
 
     cycle_num = 1
-    last_exit_ip = ""
+    last_exit_country = ""
 
-    async with async_playwright() as playwright:
-        try:
-            while True:
-                full_pool, short_pool = get_resolved_pools()
+    try:
+        while True:
+            full_pool, short_pool = get_resolved_pools()
 
-                if not full_pool and not short_pool:
-                    print("----------------------------------------------------------------------", flush=True)
-                    print(" [IDLE WAITING] Please configure target links in Railway:", flush=True)
-                    print(" -> LINKS=https://site1.com,https://site2.com", flush=True)
-                    print(" -> (Optional) BASE_URL=https://site.com & SHORT_LINKS=s1,s2", flush=True)
-                    print(" Checking again in 20s...", flush=True)
-                    print("----------------------------------------------------------------------\n", flush=True)
-                    await asyncio.sleep(20)
-                    continue
+            if not full_pool and not short_pool:
+                print("----------------------------------------------------------------------", flush=True)
+                print(" [IDLE WAITING] Please configure target links in Railway:", flush=True)
+                print(" -> Standard links: LINKS=https://site1.com,https://site2.com", flush=True)
+                print(" -> (Optional) Short links: BASE_URL=https://site.com & SHORT_LINKS=s1,s2", flush=True)
+                print(" Checking again in 20s...", flush=True)
+                print("----------------------------------------------------------------------\n", flush=True)
+                time.sleep(20)
+                continue
 
-                cycle_start = time.time()
-                worker_count = random.randint(int(WORKER_MIN), int(WORKER_MAX))
-                target_cycle_time = random.uniform(CYCLE_MIN, CYCLE_MAX)
+            cycle_start = time.time()
+            worker_count = random.randint(int(WORKER_MIN), int(WORKER_MAX))
+            target_cycle_time = random.uniform(CYCLE_MIN, CYCLE_MAX)
 
-                cycle_links = pick_cycle_targets(worker_count, full_pool, short_pool)
+            cycle_links = pick_cycle_targets(worker_count, full_pool, short_pool)
 
-                print(f"\n--- [Cycle #{cycle_num} Started] Dispatching {len(cycle_links)} real browser bots | Target: {target_cycle_time:.1f}s ---", flush=True)
+            print(f"\n--- [Cycle #{cycle_num} Started] Dispatching {len(cycle_links)} bots | Target Interval: {target_cycle_time:.1f}s ---", flush=True)
 
-                for idx, target_url in enumerate(cycle_links, start=1):
-                    last_exit_ip = await execute_real_browser_bot(
-                        idx, len(cycle_links), target_url, last_exit_ip, playwright
-                    )
+            for idx, target_url in enumerate(cycle_links, start=1):
+                last_exit_country = execute_bot(idx, len(cycle_links), target_url, last_exit_country)
 
-                elapsed = time.time() - cycle_start
-                wait_time = target_cycle_time - elapsed
+            elapsed = time.time() - cycle_start
+            wait_time = target_cycle_time - elapsed
 
-                if wait_time > 0:
-                    print(f"--- [Cycle #{cycle_num} Complete] Duration: {elapsed:.1f}s | Pausing {wait_time:.1f}s before Cycle #{cycle_num + 1} ---", flush=True)
-                    await asyncio.sleep(wait_time)
-                else:
-                    print(f"--- [Cycle #{cycle_num} Complete] Duration: {elapsed:.1f}s | Starting Cycle #{cycle_num + 1} immediately ---", flush=True)
+            if wait_time > 0:
+                print(f"--- [Cycle #{cycle_num} Complete] Duration: {elapsed:.1f}s | Pausing {wait_time:.1f}s before Cycle #{cycle_num + 1} ---", flush=True)
+                time.sleep(wait_time)
+            else:
+                print(f"--- [Cycle #{cycle_num} Complete] Duration: {elapsed:.1f}s | Starting Cycle #{cycle_num + 1} immediately ---", flush=True)
 
-                cycle_num += 1
+            cycle_num += 1
 
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            print("\nEngine stopped.", flush=True)
-            sys.exit(0)
+    except KeyboardInterrupt:
+        print("\nEngine stopped.", flush=True)
+        sys.exit(0)
 
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    main()
