@@ -10,9 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY . /app
 
-# Install playwright browser binary
-RUN playwright install chromium
+# Install playwright in python and fetch chromium binary with system dependencies
+RUN pip install --no-cache-dir playwright && python -m playwright install --with-deps chromium
+
+COPY . /app
 
 CMD ["python", "universal.py"]
